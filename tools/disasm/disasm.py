@@ -210,7 +210,21 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    # A measured target can also expose a one-byte phase drift
+                    # after an embedded jump table.  The Third Age's optimized
+                    # copy routine is one concrete case: the sweep decodes
+                    # 7E433 as `sbb al, 8b`, while its computed jump enters at
+                    # 7E434 and the stream there is a valid sequence of movs.
+                    # Keep this deliberately narrower than the generic body
+                    # probe: accepting seeds several bytes into an instruction
+                    # recreates the destructive false splits this guard exists
+                    # to prevent.
+                    one_byte_drift = (
+                        covering.address + 1 == addr and
+                        self.engine.probes_as_function_body(addr)
+                    )
+                    if (self.engine.probes_as_prologue(addr) or
+                            one_byte_drift):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(
