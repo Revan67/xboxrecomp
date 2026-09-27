@@ -43,6 +43,12 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Some XAPI save helpers bypass the T:/U: symbolic links and address the
+     * title/user data trees beneath E: (Partition1) directly.  These must win
+     * over the general Partition1 game-data rule below or writable profile
+     * files are opened inside the extracted disc tree. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA\\", 1, "\\TitleData", "/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA\\", 1, "\\UserData",  "/UserData"  },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
