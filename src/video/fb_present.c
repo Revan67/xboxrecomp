@@ -25,6 +25,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
+static volatile LONG s_fb_closed_by_user;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -43,7 +44,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (m == WM_CLOSE || m == WM_DESTROY) {
+    if (m == WM_CLOSE) {
+        /* A clear or display-mode change calls WindowStart again. Remember an
+         * explicit close for the rest of this process so those routine calls
+         * do not resurrect a window the user dismissed. A fresh process is
+         * the explicit opt-in that clears this state. */
+        InterlockedExchange(&s_fb_closed_by_user, 1);
+        InterlockedExchange(&s_fb_running, 0);
+        return 0;
+    }
+    if (m == WM_DESTROY) {
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
@@ -203,6 +213,8 @@ void xbox_FramebufferWindowStart(void)
     HANDLE th;
 
     if (!getenv("RECOMP_FB_WINDOW"))
+        return;
+    if (InterlockedCompareExchange(&s_fb_closed_by_user, 0, 0))
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
