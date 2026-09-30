@@ -6116,8 +6116,7 @@ static void bridge_DbgPrint(void)
 static void bridge_DbgPrompt(void)
 {
     (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    g_eax = 1;
 }
 
 /* --- DbgUnLoadImageSymbols (ordinal 11, 3 args = 12 bytes) --- */
