@@ -60,6 +60,7 @@ int  video_dump_frame_bmp(const char *path);
  * the title renders into guest RAM appears there; nothing else scans it out. */
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

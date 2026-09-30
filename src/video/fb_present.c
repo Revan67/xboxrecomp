@@ -15,6 +15,7 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include "video_player.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -26,6 +27,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
 static volatile LONG s_fb_closed_by_user;
+static volatile LONG s_fb_latched;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -84,6 +86,40 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
             }
         } else {
             memset(dst, 0, (size_t)s_fb_width * 4);
+        }
+    }
+}
+
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    const uint8_t *src;
+
+    xbox_FramebufferWindowSet(fb_va, pitch);
+    xbox_FramebufferWindowStart();
+    if (!s_rgb || !s_fb_va || !s_fb_pitch)
+        return;
+
+    /* Capture synchronously while the completed pixels still exist. Titles
+     * can clear or reuse a backbuffer before the 60 Hz window thread wakes;
+     * watching guest RAM directly then displays the later black clear rather
+     * than the frame which was actually submitted. */
+    src = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+    fb_convert(src, s_fb_pitch / s_fb_width);
+    InterlockedExchange(&s_fb_latched, 1);
+    if (getenv("RECOMP_FB_TRACE")) {
+        static unsigned reports;
+        uint32_t nonzero = 0, brightest = 0, i;
+        for (i = 0; i < s_fb_width * s_fb_height; i++) {
+            uint32_t rgb = s_rgb[i] & 0x00FFFFFFu;
+            if (rgb) nonzero++;
+            if (rgb > brightest) brightest = rgb;
+        }
+        if (reports < 8 || nonzero) {
+            fprintf(stderr,
+                    "  [FBWIN] latch 0x%08X pitch=%u nonzero=%u brightest=%06X\n",
+                    s_fb_va, s_fb_pitch, nonzero, brightest);
+            fflush(stderr);
+            reports++;
         }
     }
 }
@@ -182,7 +218,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb) {
+        if (s_fb_va && s_fb_pitch && s_rgb &&
+            !InterlockedCompareExchange(&s_fb_latched, 0, 0)) {
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
@@ -227,5 +264,6 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 #endif

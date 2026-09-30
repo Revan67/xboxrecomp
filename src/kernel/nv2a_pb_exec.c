@@ -40,6 +40,7 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
@@ -630,7 +631,12 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    /* Before the first draw, a clear is the only trustworthy surface. Once
+     * geometry has landed, do not let a later clear of the next backbuffer
+     * steal scanout from the completed frame. raster_batch() and FLIP_STALL
+     * move the window to drawn_offset instead. */
+    if (!s_gpu.drawn_offset)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -1362,6 +1368,10 @@ static void raster_batch(void)
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
         s_drawn_dumps++;
         dump_surface_bmp();
+    }
+    if (s_gpu.tris_drawn != before && s_gpu.drawn_offset && s_gpu.pitch) {
+        xbox_FramebufferWindowPresent(dma_resolve(s_gpu.drawn_offset),
+                                      s_gpu.pitch);
     }
     s_gpu.batches_normalized = 0;
 }
