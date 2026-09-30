@@ -188,12 +188,13 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
      * acknowledge, reads it back still pending, and recurses into a native
      * stack overflow.
      *
-     * Holding them at zero is correct rather than convenient: nothing here
-     * ever raises a GPU interrupt, so "none pending" is the truth. */
+     * PGRAPH is deliberately absent. Non-zero NV097 NOPs now raise real
+     * software-method interrupts through the guest ISR, and that delivery
+     * path clears PGRAPH_INTR after the handler returns. Clearing it here
+     * races the ISR and makes a valid interrupt appear unclaimed. */
     { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
     { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
     { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
-    { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
     { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
@@ -444,6 +445,15 @@ static struct {
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
+static struct {
+    uint32_t device_ptr_va;
+    uint32_t reference_ptr_off;
+    uint32_t last_low_reference;
+    uint32_t extended_reference;
+    int reference_initialized;
+} g_pattern_reference_mirrors[XBOX_MAX_FENCE_MIRRORS];
+static int g_pattern_reference_mirror_count;
+
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off)
 {
@@ -456,6 +466,21 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
     fprintf(stderr, "  NV2A fence mirror: device at 0x%08X,"
             " PUT +0x%X -> *(GET +0x%X)\n",
             device_ptr_va, put_off, get_ptr_off);
+    return 0;
+}
+
+int xbox_Nv2aMirrorPatternReference(uint32_t device_ptr_va,
+                                    uint32_t reference_ptr_off)
+{
+    int i = g_pattern_reference_mirror_count;
+    if (i >= XBOX_MAX_FENCE_MIRRORS)
+        return -1;
+    g_pattern_reference_mirrors[i].device_ptr_va = device_ptr_va;
+    g_pattern_reference_mirrors[i].reference_ptr_off = reference_ptr_off;
+    g_pattern_reference_mirror_count++;
+    fprintf(stderr, "  NV2A pattern-reference mirror: device at 0x%08X, "
+                    "PATT_COLOR0 -> *(+0x%X)\n",
+            device_ptr_va, reference_ptr_off);
     return 0;
 }
 /* A guest address is usable only once the window is mapped and it lands
@@ -658,6 +683,7 @@ static void frame_counters_tick(void)
 
 static void fence_mirrors_tick(void)
 {
+    static ULONGLONG pattern_trace_next_ms;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -680,6 +706,79 @@ static void fence_mirrors_tick(void)
                                        + g_memory_offset);
             if (*fence != put)
                 *fence = put;
+        }
+    }
+    for (int i = 0; i < g_pattern_reference_mirror_count; i++) {
+        uint32_t dev, reference_ptr;
+        volatile uint32_t *patt;
+        volatile uint32_t *reference;
+
+        if (!fence_readable(g_pattern_reference_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)(
+            (uintptr_t)g_pattern_reference_mirrors[i].device_ptr_va
+            + g_memory_offset);
+        if (!fence_readable(dev +
+                g_pattern_reference_mirrors[i].reference_ptr_off, 4))
+            continue;
+        reference_ptr = *(volatile uint32_t *)(
+            (uintptr_t)(dev +
+                g_pattern_reference_mirrors[i].reference_ptr_off)
+            + g_memory_offset);
+        if (!fence_readable(reference_ptr, 4))
+            continue;
+        patt = (volatile uint32_t *)((uintptr_t)XBOX_NV2A_BASE
+                                     + 0x400B10u + g_memory_offset);
+        reference = (volatile uint32_t *)((uintptr_t)reference_ptr
+                                           + g_memory_offset);
+        {
+            uint32_t old_reference = *reference;
+            uint32_t pattern = *patt;
+            uint32_t low_reference = (pattern & 0x7Cu) >> 2;
+            uint32_t new_reference;
+            if (!g_pattern_reference_mirrors[i].reference_initialized) {
+                g_pattern_reference_mirrors[i].last_low_reference =
+                    low_reference;
+                g_pattern_reference_mirrors[i].extended_reference =
+                    low_reference;
+                g_pattern_reference_mirrors[i].reference_initialized = 1;
+            } else {
+                uint32_t delta = (low_reference -
+                    g_pattern_reference_mirrors[i].last_low_reference) & 31u;
+                g_pattern_reference_mirrors[i].extended_reference += delta;
+                g_pattern_reference_mirrors[i].last_low_reference =
+                    low_reference;
+            }
+            new_reference =
+                g_pattern_reference_mirrors[i].extended_reference;
+            if (old_reference != new_reference) {
+                *reference = new_reference;
+                if (getenv("RECOMP_PATTERN_TRACE")) {
+                    fprintf(stderr, "  [NV2A] pattern mirror: dev=%08X "
+                            "refptr=%08X patt=%08X %08X->%08X\n",
+                            dev, reference_ptr, pattern, old_reference,
+                            new_reference);
+                    fflush(stderr);
+                }
+            }
+            if (getenv("RECOMP_PATTERN_TRACE")) {
+                ULONGLONG now = GetTickCount64();
+                if (now >= pattern_trace_next_ms) {
+                    pattern_trace_next_ms = now + 1000;
+                    fprintf(stderr, "  [NV2A] pattern state: dev=%08X "
+                            "+24=%08X +28=%08X +2C=%08X ref=%08X "
+                            "patt=%08X\n",
+                            dev,
+                            *(volatile uint32_t *)((uintptr_t)(dev + 0x24u)
+                                                    + g_memory_offset),
+                            *(volatile uint32_t *)((uintptr_t)(dev + 0x28u)
+                                                    + g_memory_offset),
+                            *(volatile uint32_t *)((uintptr_t)(dev + 0x2Cu)
+                                                    + g_memory_offset),
+                            *reference, pattern);
+                    fflush(stderr);
+                }
+            }
         }
     }
 }
@@ -838,7 +937,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                if (getenv("RECOMP_NV2A_TRACE") || getenv("RECOMP_PB_SCAN")) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
@@ -929,6 +1028,7 @@ static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS volatile uint32_t g_current_guest_function = 0;
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1081,6 +1181,7 @@ extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
 
 static uint32_t *s_watchdog_esp;
+static volatile uint32_t *s_watchdog_current_function;
 /* The other guest registers are thread-local too, so the watchdog has to be
  * handed the guest thread's copies rather than reading its own -- which are
  * always zero, and read as "every register is null" at exactly the moment the
@@ -1164,9 +1265,11 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
+    fprintf(stderr, "[WATCHDOG] no exit after %us; guest function=0x%08X esp=0x%08X\n"
             "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
+            s_watchdog_secs,
+            s_watchdog_current_function ? *s_watchdog_current_function : 0,
+            esp,
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
             s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
             s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
@@ -1244,10 +1347,15 @@ void xbox_WatchdogStart(void)
     if (!s_watchdog_secs)
         return;
 
+    fprintf(stderr, "[WATCHDOG] armed for %us on guest thread\n",
+            s_watchdog_secs);
+    fflush(stderr);
+
     /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
      * be handed the address of the one that matters rather than reading its
      * own, which is always zero. */
     s_watchdog_esp = &g_esp;
+    s_watchdog_current_function = &g_current_guest_function;
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;

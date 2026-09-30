@@ -2523,7 +2523,7 @@ class Lifter:
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_memcpy(edi, esi, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
@@ -2532,7 +2532,7 @@ class Lifter:
         if "movsd" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_memcpy(edi, esi, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
                     "  esi += ecx * 4; edi += ecx * 4; }",
@@ -2542,7 +2542,7 @@ class Lifter:
         if "movsw" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if (_d + _n <= _s || _s + _n <= _d) recomp_guest_memcpy(edi, esi, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
                     "  esi += ecx * 2; edi += ecx * 2; }",

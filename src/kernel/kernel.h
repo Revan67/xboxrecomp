@@ -216,6 +216,11 @@ typedef struct _XBOX_FILE_STANDARD_INFORMATION {
     BOOLEAN       Directory;
 } XBOX_FILE_STANDARD_INFORMATION, *PXBOX_FILE_STANDARD_INFORMATION;
 
+/* FILE_INTERNAL_INFORMATION */
+typedef struct _XBOX_FILE_INTERNAL_INFORMATION {
+    LARGE_INTEGER IndexNumber;
+} XBOX_FILE_INTERNAL_INFORMATION, *PXBOX_FILE_INTERNAL_INFORMATION;
+
 /* FILE_POSITION_INFORMATION */
 typedef struct _XBOX_FILE_POSITION_INFORMATION {
     LARGE_INTEGER CurrentByteOffset;
@@ -258,6 +263,14 @@ typedef struct _XBOX_FILE_DIRECTORY_INFORMATION {
 } XBOX_FILE_DIRECTORY_INFORMATION, *PXBOX_FILE_DIRECTORY_INFORMATION;
 
 /* FS_SIZE_INFORMATION */
+typedef struct _XBOX_FILE_FS_VOLUME_INFORMATION {
+    LARGE_INTEGER VolumeCreationTime;
+    ULONG         VolumeSerialNumber;
+    ULONG         VolumeLabelLength;
+    BOOLEAN       SupportsObjects;
+    WCHAR         VolumeLabel[1]; /* Variable length, byte count above */
+} XBOX_FILE_FS_VOLUME_INFORMATION, *PXBOX_FILE_FS_VOLUME_INFORMATION;
+
 typedef struct _XBOX_FILE_FS_SIZE_INFORMATION {
     LARGE_INTEGER TotalAllocationUnits;
     LARGE_INTEGER AvailableAllocationUnits;
@@ -1049,6 +1062,10 @@ VOID    __stdcall xbox_Unknown_42(void);
 #define XBOX_LOG_TRACE   4
 
 void xbox_log(int level, const char* subsystem, const char* fmt, ...);
+
+/* Queue an NV097 non-zero NO_OPERATION software method for delivery through
+ * the title's connected NV2A interrupt service routine. */
+void xbox_Nv2aQueueSoftwareMethod(uint32_t subchannel, uint32_t parameter);
 
 #ifdef _DEBUG
 #define XBOX_TRACE(subsystem, fmt, ...) xbox_log(XBOX_LOG_TRACE, subsystem, fmt, ##__VA_ARGS__)

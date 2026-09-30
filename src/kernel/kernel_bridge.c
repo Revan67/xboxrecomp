@@ -333,7 +333,25 @@ static long kernel_log_budget(void)
     return budget;
 }
 
-#define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
+/* Skip noisy early initialization when investigating a later transition.
+ * RECOMP_KERNEL_LOG_START is the first global bridge-call number to print;
+ * it composes with RECOMP_KERNEL_LOG_BUDGET, which remains the last call
+ * number printed.  The default preserves the original startup trace. */
+static long kernel_log_start(void)
+{
+    static long start = -1;
+
+    if (start < 0) {
+        const char *env = getenv("RECOMP_KERNEL_LOG_START");
+        start = env ? strtol(env, NULL, 0) : 1;
+        if (start < 1)
+            start = 1;
+    }
+    return start;
+}
+
+#define KERNEL_LOG_ON()      (g_kernel_call_count >= kernel_log_start() && \
+                              g_kernel_call_count <= kernel_log_budget())
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
 #define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
 
@@ -1886,6 +1904,8 @@ static void bridge_KeRemoveQueueDpc(void)
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+static volatile LONG g_dpc_trace_insertions;
+static volatile LONG g_dpc_trace_runs;
 
 static void bridge_KeInsertQueueDpc(void)
 {
@@ -1908,6 +1928,16 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
+    if (getenv("RECOMP_DPC_TRACE")) {
+        LONG n = InterlockedIncrement(&g_dpc_trace_insertions);
+        if (n <= 64 || (n % 1000) == 0) {
+            fprintf(stderr, "  [KERNEL] DPC queue #%ld: object=%08X "
+                    "routine=%08X context=%08X args=%08X,%08X\n",
+                    n, dpc, BRIDGE_MEM32(dpc + 12),
+                    BRIDGE_MEM32(dpc + 16), arg1, arg2);
+            fflush(stderr);
+        }
+    }
     g_eax = 1;
 }
 
@@ -1968,10 +1998,103 @@ static int kernel_raise_interrupt(uint32_t vector)
  */
 #define XBOX_NV2A_REG_BASE     0xFD000000u
 #define NV2A_PMC_INTR_0        0x00000100u
+#define NV2A_PMC_INTR_PGRAPH   (1u << 12)
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
+#define NV2A_PGRAPH_INTR       0x00400100u
+#define NV2A_PGRAPH_NSOURCE    0x00400108u
+#define NV2A_PGRAPH_TRAPPED_ADDR 0x00400704u
+#define NV2A_PGRAPH_TRAPPED_DATA 0x00400708u
+#define NV2A_PGRAPH_METHOD_NOP  0x00000100u
+#define NV2A_PGRAPH_INTR_ERROR (1u << 20)
+#define NV2A_PGRAPH_NSOURCE_NOTIFICATION (1u << 0)
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
+
+/* NV097 uses a non-zero NO_OPERATION as a software method: PGRAPH traps the
+ * method/data pair and interrupts the CPU, where Xbox D3D performs its flip
+ * and push-buffer bookkeeping. Push-buffer execution happens on the NV2A
+ * acknowledgement thread while guest ISRs require their own translated
+ * register/TLS context, so pass the traps to the existing timer thread.
+ *
+ * There is one producer and one consumer. Publishing tail with an interlocked
+ * exchange occurs after the slot write; consuming head likewise happens only
+ * after the payload has been copied. Sixty-four entries comfortably covers
+ * startup bursts (Third Age submits eight before its first wait). */
+#define NV2A_SOFTWARE_METHOD_QUEUE 64
+typedef struct Nv2aSoftwareMethod {
+    uint32_t subchannel;
+    uint32_t parameter;
+} Nv2aSoftwareMethod;
+static Nv2aSoftwareMethod g_nv2a_software_methods[NV2A_SOFTWARE_METHOD_QUEUE];
+static volatile LONG g_nv2a_software_head;
+static volatile LONG g_nv2a_software_tail;
+
+void xbox_Nv2aQueueSoftwareMethod(uint32_t subchannel, uint32_t parameter)
+{
+    LONG tail = InterlockedCompareExchange(&g_nv2a_software_tail, 0, 0);
+    LONG next = (tail + 1) % NV2A_SOFTWARE_METHOD_QUEUE;
+    LONG head = InterlockedCompareExchange(&g_nv2a_software_head, 0, 0);
+
+    if (next == head) {
+        fprintf(stderr, "  [NV2A] software-method queue full; dropping "
+                        "0x%08X\n", parameter);
+        fflush(stderr);
+        return;
+    }
+    g_nv2a_software_methods[tail].subchannel = subchannel;
+    g_nv2a_software_methods[tail].parameter = parameter;
+    InterlockedExchange(&g_nv2a_software_tail, next);
+}
+
+static void kernel_pgraph_software_method_tick(void)
+{
+    LONG head;
+    LONG tail;
+
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+
+    for (;;) {
+        Nv2aSoftwareMethod m;
+        int claimed;
+
+        head = InterlockedCompareExchange(&g_nv2a_software_head, 0, 0);
+        tail = InterlockedCompareExchange(&g_nv2a_software_tail, 0, 0);
+        if (head == tail)
+            break;
+        m = g_nv2a_software_methods[head];
+        InterlockedExchange(&g_nv2a_software_head,
+                            (head + 1) % NV2A_SOFTWARE_METHOD_QUEUE);
+
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_ADDR) =
+            (m.subchannel & 7u) << 16 | NV2A_PGRAPH_METHOD_NOP;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_DATA) =
+            m.parameter;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) =
+            NV2A_PGRAPH_NSOURCE_NOTIFICATION;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) =
+            NV2A_PGRAPH_INTR_ERROR;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) |=
+            NV2A_PMC_INTR_PGRAPH;
+
+        claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+            fprintf(stderr, "  [NV2A] software NOP 0x%08X -> ISR %s\n",
+                    m.parameter, claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+
+        /* These are W1C registers on hardware. The ISR has acknowledged the
+         * trap by the time it returns; plain mapped RAM needs the completion
+         * reflected explicitly. */
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) = 0;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) &=
+            ~NV2A_PMC_INTR_PGRAPH;
+    }
+}
 
 static void kernel_vblank_tick(void)
 {
@@ -2020,6 +2143,16 @@ static void kernel_drain_dpcs(void)
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+        if (getenv("RECOMP_DPC_TRACE")) {
+            LONG n = InterlockedIncrement(&g_dpc_trace_runs);
+            if (n <= 64 || (n % 1000) == 0) {
+                fprintf(stderr, "  [KERNEL] DPC run   #%ld: object=%08X "
+                        "routine=%08X context=%08X args=%08X,%08X\n",
+                        n, d.dpc, BRIDGE_MEM32(d.dpc + 12),
+                        BRIDGE_MEM32(d.dpc + 16), d.arg1, d.arg2);
+                fflush(stderr);
+            }
+        }
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
@@ -2274,6 +2407,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(10);
+        kernel_pgraph_software_method_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -2505,20 +2639,44 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+static CRITICAL_SECTION s_handle_table_lock;
+static int s_handle_table_lock_initialized;
+static uint32_t s_handle_next_slot = 1;
+static ULONGLONG s_handle_retire_at[BRIDGE_HANDLE_MAX];
+
+#define BRIDGE_HANDLE_RETIRE_MS 1000u
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
-    int i;
+    uint32_t i;
+    uint32_t token = 0;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+    EnterCriticalSection(&s_handle_table_lock);
+
+    /* Xbox IRPs retain their file object even if another thread closes the
+     * guest handle.  Our host operation is synchronous, but the title's own
+     * stream worker can receive a borrowed token just before its owner closes
+     * it. Keep closed native handles alive briefly so that in-flight work sees
+     * the same lifetime guarantee, then reap them during later allocations. */
+    {
+        ULONGLONG now = GetTickCount64();
+        for (i = 1; i < s_handle_next_slot; i++) {
+            if (s_handle_retire_at[i] && s_handle_retire_at[i] <= now) {
+                CloseHandle(s_handle_table[i]);
+                s_handle_table[i] = NULL;
+                s_handle_retire_at[i] = 0;
+            }
         }
-    fprintf(stderr, "  [BRIDGE] handle table full\n");
-    return 0;
+    }
+    if (s_handle_next_slot < BRIDGE_HANDLE_MAX) {
+        i = s_handle_next_slot++;
+        s_handle_table[i] = h;
+        token = BRIDGE_HANDLE_TAG | i;
+    } else {
+        fprintf(stderr, "  [BRIDGE] handle table exhausted\n");
+    }
+    LeaveCriticalSection(&s_handle_table_lock);
+    return token;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -2534,7 +2692,11 @@ static HANDLE bridge_read_handle(uint32_t va)
     uint32_t token = BRIDGE_MEM32(va);
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        HANDLE h = NULL;
+        EnterCriticalSection(&s_handle_table_lock);
+        if (i > 0 && i < BRIDGE_HANDLE_MAX) h = s_handle_table[i];
+        LeaveCriticalSection(&s_handle_table_lock);
+        return h;
     }
     /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
@@ -2557,7 +2719,11 @@ static HANDLE bridge_resolve_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        HANDLE h = NULL;
+        EnterCriticalSection(&s_handle_table_lock);
+        if (i > 0 && i < BRIDGE_HANDLE_MAX) h = s_handle_table[i];
+        LeaveCriticalSection(&s_handle_table_lock);
+        return h;
     }
     /* Untagged: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
@@ -2567,11 +2733,15 @@ static HANDLE bridge_take_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
+        EnterCriticalSection(&s_handle_table_lock);
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
-            s_handle_table[i] = NULL;
-            return h;
+            if (s_handle_table[i] && !s_handle_retire_at[i])
+                s_handle_retire_at[i] = GetTickCount64() + BRIDGE_HANDLE_RETIRE_MS;
         }
+        LeaveCriticalSection(&s_handle_table_lock);
+        /* Retirement owns the native handle now; NtClose must not close it a
+         * second time. */
+        return NULL;
     }
     return NULL;   /* untagged -> not a table handle, do not close */
 }
@@ -3053,7 +3223,7 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
-    {
+    if (getenv("RECOMP_FILE_TRACE")) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -9074,6 +9244,11 @@ void xbox_kernel_bridge_init(void)
     int bridged = 0;
     int unbridged = 0;
     DWORD old_protect;
+
+    if (!s_handle_table_lock_initialized) {
+        InitializeCriticalSection(&s_handle_table_lock);
+        s_handle_table_lock_initialized = 1;
+    }
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);

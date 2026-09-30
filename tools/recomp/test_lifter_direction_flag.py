@@ -40,7 +40,7 @@ class DirectionFlagLifterTest(unittest.TestCase):
 
         # memcpy is still there for the common case, but guarded: it is only
         # reached when the ranges provably do not overlap.
-        self.assertIn("memcpy(_d, _s, _n)", generated)
+        self.assertIn("recomp_guest_memcpy(edi, esi, _n)", generated)
         self.assertIn("_d + _n <= _s || _s + _n <= _d", generated)
 
     def test_rep_movsb_propagates_an_overlapping_forward_copy(self):

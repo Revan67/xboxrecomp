@@ -900,6 +900,11 @@ class FunctionTranslator:
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
 
+        # Keep the current guest function in TLS. A watchdog on another host
+        # thread can sample the main guest thread's slot without having its
+        # evidence overwritten by timer and DPC calls.
+        lines.append(f"    g_current_guest_function = 0x{start:08X}u;")
+
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
         # a function loses the body you were trying to observe.

@@ -35,6 +35,9 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 
+#define NV097_NO_OPERATION  0x0100u
+#define NV097_WAIT_FOR_IDLE 0x0110u
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -250,6 +253,7 @@ static struct {
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    uint32_t batches_normalized;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
@@ -1135,6 +1139,31 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
+/* Third Age's loading/UI vertex program consumes quads in [0,1] and expands
+ * them across the active viewport.  The software path does not execute that
+ * program yet, but this input is unambiguous: every position is float4 with
+ * z=w=1 and x/y confined to the normalized viewport.  Object-space geometry
+ * does not satisfy all four conditions, so keep this deliberately narrow. */
+static int batch_is_normalized_viewport(void)
+{
+    float p[4];
+    uint32_t i;
+
+    if (!s_gpu.clip_w || !s_gpu.clip_h || !s_gpu.idx_count
+            || s_gpu.attr[0].type != 2 || s_gpu.attr[0].size != 4)
+        return 0;
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
+            return 0;
+        if (p[0] < -0.01f || p[0] > 1.01f
+         || p[1] < -0.01f || p[1] > 1.01f
+         || fabsf(p[2] - 1.0f) > 0.001f
+         || fabsf(p[3] - 1.0f) > 0.001f)
+            return 0;
+    }
+    return 1;
+}
+
 /* NV097 primitive types that are triangles under some winding. */
 #define NV_PRIM_TRIANGLES      4
 #define NV_PRIM_TRIANGLE_STRIP 5
@@ -1164,6 +1193,14 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
 
+    if (s_gpu.batches_normalized) {
+        uint32_t i;
+        for (i = 0; i < 3; i++) {
+            p[i][0] = (float)s_gpu.clip_x + p[i][0] * (float)s_gpu.clip_w;
+            p[i][1] = (float)s_gpu.clip_y + p[i][1] * (float)s_gpu.clip_h;
+        }
+    }
+
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
             && fetch_texcoord(i2, uv[2]);
@@ -1176,13 +1213,18 @@ static void raster_batch(void)
 {
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
+    int normalized;
 
     if (s_gpu.idx_count < 3)
         return;
-    if (!batch_is_screen_space()) {
+    normalized = batch_is_normalized_viewport();
+    if (!normalized && !batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
     }
+
+    /* Used only while this batch is synchronously rasterised. */
+    s_gpu.batches_normalized = normalized ? 1u : 0u;
 
     /* Count why, once per batch: the texture stage cannot change inside one. */
     {
@@ -1236,6 +1278,7 @@ static void raster_batch(void)
         s_drawn_dumps++;
         dump_surface_bmp();
     }
+    s_gpu.batches_normalized = 0;
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the
@@ -1566,11 +1609,37 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    /* D3D binds its context-pattern object on subchannel 5. Its colour0
+     * method writes the real PGRAPH_PATT_COLOR0 register, which the
+     * push-buffer allocator reads back as a hardware progress/coherency
+     * handshake. Dropping all non-3D subchannels leaves that register zero
+     * and strands the CPU in sub_0022BE80 after the first submission. */
+    if (subch == 5 && method == 0x0310u) {
+        volatile uint32_t *patt = (volatile uint32_t *)(
+            (uintptr_t)0xFD400B10u + xbox_GetMemoryOffset());
+        *patt = param;
+        return;
+    }
+
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
     }
     switch (method) {
+    case NV097_NO_OPERATION:
+        /* A non-zero Kelvin NOP is an Xbox software method. Hardware traps it
+         * and raises PGRAPH ERROR/NOTIFICATION; the D3D ISR decodes the
+         * payload. Treating it as an inert method leaves D3D's flip and
+         * push-buffer bookkeeping permanently stale. */
+        if (param)
+            xbox_Nv2aQueueSoftwareMethod(subch, param);
+        break;
+
+    case NV097_WAIT_FOR_IDLE:
+        /* This executor is synchronous, so all work seen before this method
+         * is already complete. */
+        break;
+
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;

@@ -176,13 +176,18 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
+                uint32_t param = *(const uint32_t *)(mem + va);
                 note(subch, m);
+                if (getenv("RECOMP_PB_METHOD_TRACE"))
+                    fprintf(stderr,
+                            "  [PBTRACE] va=0x%08X subch=%u method=0x%04X"
+                            " param=0x%08X\n",
+                            va, subch, m, param);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
                 if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                    nv2a_pb_exec_method(subch, m, param);
                 va += 4;
                 words++;
             }

@@ -192,6 +192,12 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Mirror PGRAPH's five-bit pattern reference into a GPU-owned word reached
+ * through a D3D device. Some XDK push-buffer allocators use this cache
+ * coherency handshake rather than a monotonically increasing fence. */
+int xbox_Nv2aMirrorPatternReference(uint32_t device_ptr_va,
+                                    uint32_t reference_ptr_off);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

@@ -16,8 +16,10 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -235,23 +237,51 @@ NTSTATUS __stdcall xbox_NtReadFile(
     PLARGE_INTEGER ByteOffset)
 {
     DWORD bytes_read = 0;
+    DWORD error = ERROR_SUCCESS;
     BOOL result;
-    OVERLAPPED ov;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
-        memset(&ov, 0, sizeof(ov));
-        ov.Offset = ByteOffset->LowPart;
-        ov.OffsetHigh = ByteOffset->HighPart;
-        result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
+        /* These handles are opened without FILE_FLAG_OVERLAPPED.  Passing an
+         * OVERLAPPED structure to ReadFile on a synchronous handle does not
+         * provide reliable positioned-I/O semantics: Windows may use the
+         * handle's current file pointer and can eventually fail a perfectly
+         * valid sector-aligned stream read with ERROR_INVALID_PARAMETER.
+         *
+         * Xbox NtReadFile still accepts an explicit ByteOffset for a
+         * synchronous file.  Seek the synchronous host handle first, just as
+         * the POSIX backend does, then perform an ordinary synchronous read. */
+        if (!SetFilePointerEx(FileHandle, *ByteOffset, NULL, FILE_BEGIN)) {
+            error = GetLastError();
+            result = FALSE;
+        } else {
+            result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
+        }
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
 
-    if (result || GetLastError() == ERROR_HANDLE_EOF) {
+    if (!result)
+        error = GetLastError();
+
+    if (!result && getenv("RECOMP_FILE_TRACE")) {
+        LARGE_INTEGER trace_size = {0};
+        WCHAR trace_path[MAX_PATH];
+        DWORD trace_len = GetFinalPathNameByHandleW(FileHandle, trace_path,
+            MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        GetFileSizeEx(FileHandle, &trace_size);
+        fprintf(stderr, "  [READ-FAIL] err=%u offset=%lld size=%lld path=%S\n",
+                error,
+                ByteOffset ? (long long)ByteOffset->QuadPart : -1LL,
+                (long long)trace_size.QuadPart,
+                trace_len && trace_len < MAX_PATH ? trace_path : L"<unknown>");
+        fflush(stderr);
+    }
+
+    if (result || error == ERROR_HANDLE_EOF) {
         IoStatusBlock->Information = bytes_read;
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -262,8 +292,23 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_SUCCESS;
     }
 
+    /* A synchronous Win32 file handle can report ERROR_INVALID_PARAMETER for
+     * an OVERLAPPED read whose explicit offset is exactly at (or beyond) EOF.
+     * Xbox NtReadFile reports STATUS_END_OF_FILE for that request.  Streaming
+     * code relies on the distinction: Third Age treats a generic failure as a
+     * retryable disc error and eventually enters its fatal-error renderer. */
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        LARGE_INTEGER size;
+        if (GetFileSizeEx(FileHandle, &size) && ByteOffset->QuadPart >= size.QuadPart) {
+            IoStatusBlock->Status = STATUS_END_OF_FILE;
+            IoStatusBlock->Information = 0;
+            if (Event) SetEvent(Event);
+            return STATUS_END_OF_FILE;
+        }
+    }
+
     XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p, len=%u) failed err=%u",
-               FileHandle, Length, GetLastError());
+               FileHandle, Length, error);
     IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
     IoStatusBlock->Information = 0;
     return STATUS_UNSUCCESSFUL;
@@ -276,17 +321,18 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 {
     DWORD bytes_written = 0;
     BOOL result;
-    OVERLAPPED ov;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
-        memset(&ov, 0, sizeof(ov));
-        ov.Offset = ByteOffset->LowPart;
-        ov.OffsetHigh = ByteOffset->HighPart;
-        result = WriteFile(FileHandle, Buffer, Length, &bytes_written, &ov);
+        if (!SetFilePointerEx(FileHandle, *ByteOffset, NULL, FILE_BEGIN)) {
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Information = 0;
+            return STATUS_UNSUCCESSFUL;
+        }
+        result = WriteFile(FileHandle, Buffer, Length, &bytes_written, NULL);
     } else {
         result = WriteFile(FileHandle, Buffer, Length, &bytes_written, NULL);
     }
@@ -367,6 +413,18 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_STANDARD_INFORMATION);
             return STATUS_SUCCESS;
         }
+        case XboxFileInternalInformation: {
+            PXBOX_FILE_INTERNAL_INFORMATION info =
+                (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (!GetFileInformationByHandle(FileHandle, &fi))
+                return STATUS_UNSUCCESSFUL;
+            info->IndexNumber.LowPart = fi.nFileIndexLow;
+            info->IndexNumber.HighPart = fi.nFileIndexHigh;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(*info);
+            return STATUS_SUCCESS;
+        }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
             LARGE_INTEGER pos, zero;
@@ -398,8 +456,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             return STATUS_SUCCESS;
         }
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryInformationFile: unhandled class %d", FileInformationClass);
+            fprintf(stderr, "  [FILE] NtQueryInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }
@@ -511,6 +570,32 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            static const WCHAR label[] = { 'X', 'B', 'O', 'X' };
+            const ULONG base = (ULONG)offsetof(XBOX_FILE_FS_VOLUME_INFORMATION,
+                                               VolumeLabel);
+            const ULONG label_bytes = (ULONG)sizeof(label);
+            PXBOX_FILE_FS_VOLUME_INFORMATION info =
+                (PXBOX_FILE_FS_VOLUME_INFORMATION)FsInformation;
+            ULONG copied;
+
+            if (Length < base) {
+                IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+                IoStatusBlock->Information = 0;
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            memset(info, 0, Length);
+            info->VolumeSerialNumber = 0x4541005Fu;
+            info->VolumeLabelLength = label_bytes;
+            info->SupportsObjects = FALSE;
+            copied = Length - base;
+            if (copied > label_bytes) copied = label_bytes;
+            if (copied) memcpy(info->VolumeLabel, label, copied);
+            IoStatusBlock->Information = base + copied;
+            IoStatusBlock->Status = copied == label_bytes
+                ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+            return IoStatusBlock->Status;
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
@@ -959,6 +1044,14 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_STANDARD_INFORMATION);
             return STATUS_SUCCESS;
         }
+        case XboxFileInternalInformation: {
+            PXBOX_FILE_INTERNAL_INFORMATION info =
+                (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            info->IndexNumber.QuadPart = (LONGLONG)st.st_ino;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(*info);
+            return STATUS_SUCCESS;
+        }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
             off_t pos = lseek(fd, 0, SEEK_CUR);
@@ -982,8 +1075,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             return STATUS_SUCCESS;
         }
         default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryInformationFile: unhandled class %d", FileInformationClass);
+            fprintf(stderr, "  [FILE] NtQueryInformationFile: unhandled class %d\n",
+                    (int)FileInformationClass);
+            fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
 }
@@ -1052,6 +1146,32 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            static const WCHAR label[] = { 'X', 'B', 'O', 'X' };
+            const ULONG base = (ULONG)offsetof(XBOX_FILE_FS_VOLUME_INFORMATION,
+                                               VolumeLabel);
+            const ULONG label_bytes = (ULONG)sizeof(label);
+            PXBOX_FILE_FS_VOLUME_INFORMATION info =
+                (PXBOX_FILE_FS_VOLUME_INFORMATION)FsInformation;
+            ULONG copied;
+
+            if (Length < base) {
+                IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+                IoStatusBlock->Information = 0;
+                return STATUS_BUFFER_OVERFLOW;
+            }
+            memset(info, 0, Length);
+            info->VolumeSerialNumber = 0x4541005Fu;
+            info->VolumeLabelLength = label_bytes;
+            info->SupportsObjects = FALSE;
+            copied = Length - base;
+            if (copied > label_bytes) copied = label_bytes;
+            if (copied) memcpy(info->VolumeLabel, label, copied);
+            IoStatusBlock->Information = base + copied;
+            IoStatusBlock->Status = copied == label_bytes
+                ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+            return IoStatusBlock->Status;
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;

@@ -161,6 +161,7 @@ extern uint32_t g_xbox_code_hi;
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS volatile uint32_t g_current_guest_function;
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
@@ -1010,6 +1011,25 @@ static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
     dst.f[0] = (float)src.d[0];
     dst.f[1] = (float)src.d[1];
     return dst;
+}
+
+/* REP MOVS normally takes the host memcpy fast path.  That is unsafe when a
+ * guest endpoint is an MMIO aperture: the Windows CRT may issue a 64-byte
+ * AVX-512 load, while the VEH decoder intentionally models scalar Xbox MMIO
+ * accesses.  Keep ordinary RAM copies fast and force volatile byte accesses
+ * only for hardware windows. */
+static inline void recomp_guest_memcpy(uint32_t dst, uint32_t src, uint32_t n)
+{
+    uint8_t *d = (uint8_t *)XBOX_PTR(dst);
+    const uint8_t *s = (const uint8_t *)XBOX_PTR(src);
+    uint32_t i;
+
+    if (src < 0xFD000000u && dst < 0xFD000000u) {
+        memcpy(d, s, n);
+        return;
+    }
+    for (i = 0; i < n; i++)
+        ((volatile uint8_t *)d)[i] = ((const volatile uint8_t *)s)[i];
 }
 
 static inline RecompMmx MMX_MEM(uint32_t addr) {
