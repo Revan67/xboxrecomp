@@ -3349,19 +3349,33 @@ static void bridge_NtReadFile(void)
     if (getenv("RECOMP_FILE_TRACE")) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
+        WCHAR trace_path[MAX_PATH];
+        const WCHAR *trace_name = L"";
+        if (getenv("RECOMP_FILE_TRACE_PATHS")) {
+            DWORD trace_len = GetFinalPathNameByHandleW(handle, trace_path,
+                MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (trace_len && trace_len < MAX_PATH) {
+                trace_name = wcsrchr(trace_path, L'\\');
+                trace_name = trace_name ? trace_name + 1 : trace_path;
+            } else {
+                trace_name = L"<unknown>";
+            }
+        }
         /* The offset matters as much as the length. A title streaming a pack
          * file reads sector-aligned chunks, so the first bytes belong to
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ]%s%ls%s @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    *trace_name ? " [" : "", trace_name, *trace_name ? "]" : "",
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ]%s%ls%s @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    *trace_name ? " [" : "", trace_name, *trace_name ? "]" : "",
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
