@@ -1869,6 +1869,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
+        /* Scan out the buffer which actually received the completed frame.
+         * A double-buffered title may select and clear its next backbuffer
+         * before FLIP_STALL arrives. Following color_offset from that clear
+         * shows an entirely valid black next frame while the finished pixels
+         * remain in drawn_offset. Hardware flips the completed front buffer,
+         * so make the framebuffer window follow the same surface here. */
+        if (s_gpu.drawn_offset && s_gpu.pitch) {
+            xbox_FramebufferWindowSet(dma_resolve(s_gpu.drawn_offset),
+                                      s_gpu.pitch);
+            xbox_FramebufferWindowStart();
+        }
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
