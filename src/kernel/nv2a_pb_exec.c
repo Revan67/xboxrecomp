@@ -1668,6 +1668,20 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+
+    /* Shader programs reuse the same upload slots. A frequency summary keeps
+     * only the last word written to each method and can therefore splice two
+     * different programs into one impossible program. Keep this deliberately
+     * narrow trace available for title bring-up so upload order, load/start
+     * boundaries and execution mode survive in the log. */
+    if (getenv("RECOMP_VSH_TRACE")
+            && ((method >= 0x0B00u && method < 0x0B80u)
+             || method == NV097_SET_BEGIN_END
+             || (method >= 0x1E94u && method <= 0x1EA4u))) {
+        fprintf(stderr, "  [VSH] subch %u method 0x%04X = 0x%08X\n",
+                subch, method, param);
+    }
+
     if (!inited) {
         inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
