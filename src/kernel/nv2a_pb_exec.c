@@ -150,6 +150,8 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_BLEND_ONE_MINUS_SRC_ALPHA   0x0303
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
 #define NV097_CLEAR_SURFACE               0x1D94
+#define NV097_SET_CLEAR_RECT_HORIZONTAL   0x1D98
+#define NV097_SET_CLEAR_RECT_VERTICAL     0x1D9C
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
@@ -257,6 +259,8 @@ static struct {
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
+    uint32_t clear_x0, clear_x1, clear_y0, clear_y1;
+    uint32_t clear_rect_valid;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
@@ -517,27 +521,44 @@ static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    uint32_t y, x;
+    uint32_t y, x, x0, x1, y0, y1;
 
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+
+    /* CLEAR_RECT stores inclusive endpoints. Intersect it with the active
+     * surface clip, just as the hardware does. Older traces may reach a clear
+     * before both rectangle registers have been written, in which case the
+     * clip remains the only trustworthy extent. */
+    x0 = s_gpu.clip_x;
+    x1 = s_gpu.clip_x + s_gpu.clip_w - 1;
+    y0 = s_gpu.clip_y;
+    y1 = s_gpu.clip_y + s_gpu.clip_h - 1;
+    if (s_gpu.clear_rect_valid == 3) {
+        if (s_gpu.clear_x0 > x0) x0 = s_gpu.clear_x0;
+        if (s_gpu.clear_x1 < x1) x1 = s_gpu.clear_x1;
+        if (s_gpu.clear_y0 > y0) y0 = s_gpu.clear_y0;
+        if (s_gpu.clear_y1 < y1) y1 = s_gpu.clear_y1;
+    }
+    if (x0 > x1 || y0 > y1)
+        return;
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  (y1 + 1) * s_gpu.pitch,
                                   "clear"))
             return;
         s_gpu.color_base = base;
     }
 
-    for (y = 0; y < s_gpu.clip_h; y++) {
+    for (y = y0; y <= y1; y++) {
         uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+                     + (size_t)y * s_gpu.pitch;
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
+            uint32_t *p = (uint32_t *)row + x0;
+            for (x = 0; x <= x1 - x0; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
             /* The clear value is always given as A8R8G8B8; a 16-bit surface
@@ -545,8 +566,8 @@ static void clear_surface(uint32_t param)
             uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
                                   | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
-            for (x = 0; x < s_gpu.clip_w; x++)
+            uint16_t *p = (uint16_t *)row + x0;
+            for (x = 0; x <= x1 - x0; x++)
                 p[x] = v;
         }
     }
@@ -1723,6 +1744,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
+        break;
+    case NV097_SET_CLEAR_RECT_HORIZONTAL:
+        s_gpu.clear_x0 = param & 0xFFFFu;
+        s_gpu.clear_x1 = param >> 16;
+        s_gpu.clear_rect_valid |= 1u;
+        break;
+    case NV097_SET_CLEAR_RECT_VERTICAL:
+        s_gpu.clear_y0 = param & 0xFFFFu;
+        s_gpu.clear_y1 = param >> 16;
+        s_gpu.clear_rect_valid |= 2u;
         break;
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param != 0;
