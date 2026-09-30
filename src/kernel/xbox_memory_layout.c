@@ -1188,6 +1188,115 @@ static volatile uint32_t *s_watchdog_current_function;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+static unsigned  s_guest_sample_delay;
+static unsigned  s_guest_sample_secs;
+static CRITICAL_SECTION s_guest_thread_lock;
+static int s_guest_thread_lock_initialized;
+static volatile uint32_t *s_guest_threads[32];
+
+void xbox_DiagnosticsRegisterGuestThread(volatile uint32_t *current_function)
+{
+    unsigned i;
+
+    if (!current_function || !s_guest_thread_lock_initialized)
+        return;
+    EnterCriticalSection(&s_guest_thread_lock);
+    for (i = 0; i < sizeof s_guest_threads / sizeof s_guest_threads[0]; i++) {
+        if (s_guest_threads[i] == current_function)
+            break;
+        if (!s_guest_threads[i]) {
+            s_guest_threads[i] = current_function;
+            break;
+        }
+    }
+    LeaveCriticalSection(&s_guest_thread_lock);
+}
+
+void xbox_DiagnosticsUnregisterGuestThread(volatile uint32_t *current_function)
+{
+    unsigned i;
+
+    if (!current_function || !s_guest_thread_lock_initialized)
+        return;
+    EnterCriticalSection(&s_guest_thread_lock);
+    for (i = 0; i < sizeof s_guest_threads / sizeof s_guest_threads[0]; i++)
+        if (s_guest_threads[i] == current_function) {
+            s_guest_threads[i] = NULL;
+            break;
+        }
+    LeaveCriticalSection(&s_guest_thread_lock);
+}
+
+#define GUEST_SAMPLE_SLOTS 4096
+static struct {
+    uint32_t va;
+    uint32_t hits;
+} s_guest_samples[GUEST_SAMPLE_SLOTS];
+
+static DWORD WINAPI xbox_guest_sample_thread(LPVOID unused)
+{
+    ULONGLONG stop_at;
+    unsigned i, shown;
+    uint64_t total = 0;
+
+    (void)unused;
+    if (s_guest_sample_delay)
+        Sleep(s_guest_sample_delay * 1000u);
+
+    memset(s_guest_samples, 0, sizeof s_guest_samples);
+    fprintf(stderr, "[SAMPLE] guest function sampling for %us after %us delay\n",
+            s_guest_sample_secs, s_guest_sample_delay);
+    fflush(stderr);
+
+    stop_at = GetTickCount64() + (ULONGLONG)s_guest_sample_secs * 1000u;
+    while (GetTickCount64() < stop_at) {
+        unsigned thread;
+
+        EnterCriticalSection(&s_guest_thread_lock);
+        for (thread = 0;
+                thread < sizeof s_guest_threads / sizeof s_guest_threads[0];
+                thread++) {
+            uint32_t va;
+            unsigned at, n;
+
+            if (!s_guest_threads[thread])
+                continue;
+            va = *s_guest_threads[thread];
+            if (!va)
+                continue;
+            at = (va * 2654435761u) & (GUEST_SAMPLE_SLOTS - 1);
+            for (n = 0; n < GUEST_SAMPLE_SLOTS; n++) {
+                unsigned k = (at + n) & (GUEST_SAMPLE_SLOTS - 1);
+                if (!s_guest_samples[k].hits || s_guest_samples[k].va == va) {
+                    s_guest_samples[k].va = va;
+                    s_guest_samples[k].hits++;
+                    total++;
+                    break;
+                }
+            }
+        }
+        LeaveCriticalSection(&s_guest_thread_lock);
+        Sleep(1);
+    }
+
+    fprintf(stderr, "[SAMPLE] %llu samples, hottest guest functions:\n",
+            (unsigned long long)total);
+    for (shown = 0; shown < 20; shown++) {
+        unsigned best = GUEST_SAMPLE_SLOTS;
+        for (i = 0; i < GUEST_SAMPLE_SLOTS; i++)
+            if (s_guest_samples[i].hits
+                    && (best == GUEST_SAMPLE_SLOTS
+                        || s_guest_samples[i].hits > s_guest_samples[best].hits))
+                best = i;
+        if (best == GUEST_SAMPLE_SLOTS)
+            break;
+        fprintf(stderr, "  %8u  0x%08X\n",
+                s_guest_samples[best].hits, s_guest_samples[best].va);
+        s_guest_samples[best].hits = 0;
+    }
+    fflush(stderr);
+    return 0;
+}
 
 /* Can RECOMP_PEEK dereference this guest address?
  *
@@ -1339,7 +1448,38 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *sample = getenv("RECOMP_GUEST_SAMPLE");
     HANDLE h;
+
+    /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
+     * be handed the address of the one that matters rather than reading its
+     * own, which is always zero. */
+    s_watchdog_esp = &g_esp;
+    s_watchdog_current_function = &g_current_guest_function;
+    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
+    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
+    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
+    if (!s_guest_thread_lock_initialized) {
+        InitializeCriticalSection(&s_guest_thread_lock);
+        s_guest_thread_lock_initialized = 1;
+    }
+    xbox_DiagnosticsRegisterGuestThread(&g_current_guest_function);
+
+    /* RECOMP_GUEST_SAMPLE=<delay>,<duration> periodically samples the guest
+     * function marker without terminating the title. It complements the
+     * watchdog's single snapshot when a title is making progress very slowly
+     * and one unlucky instant is not enough to identify the hot routine. */
+    if (sample && *sample) {
+        char *end;
+        s_guest_sample_delay = (unsigned)strtoul(sample, &end, 0);
+        s_guest_sample_secs = (*end == ',')
+                            ? (unsigned)strtoul(end + 1, NULL, 0) : 10u;
+        if (s_guest_sample_secs) {
+            h = CreateThread(NULL, 0, xbox_guest_sample_thread, NULL, 0, NULL);
+            if (h)
+                CloseHandle(h);
+        }
+    }
 
     if (!secs || !*secs)
         return;
@@ -1351,14 +1491,6 @@ void xbox_WatchdogStart(void)
             s_watchdog_secs);
     fflush(stderr);
 
-    /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
-     * be handed the address of the one that matters rather than reading its
-     * own, which is always zero. */
-    s_watchdog_esp = &g_esp;
-    s_watchdog_current_function = &g_current_guest_function;
-    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
-    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
-    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
     h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
     if (h)
         CloseHandle(h);

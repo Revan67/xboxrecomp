@@ -49,6 +49,7 @@
  * reads as every register being zero. */
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS volatile uint32_t g_current_guest_function;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
@@ -442,6 +443,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
+    xbox_DiagnosticsRegisterGuestThread(&g_current_guest_function);
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (tib)
@@ -460,6 +462,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
+    xbox_DiagnosticsUnregisterGuestThread(&g_current_guest_function);
     return 0;
 }
 
@@ -1749,6 +1752,7 @@ static void bridge_PsTerminateSystemThread(void)
          * to do it. */
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
+        xbox_DiagnosticsUnregisterGuestThread(&g_current_guest_function);
         ExitThread(exit_status);
     }
 }

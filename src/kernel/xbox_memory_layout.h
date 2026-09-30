@@ -227,6 +227,12 @@ void xbox_ProtectMirrorsForDebug(void);
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
 
+/* Register each host thread that executes recompiled guest code so the
+ * opt-in RECOMP_GUEST_SAMPLE diagnostic can sample workers as well as the
+ * main guest thread. */
+void xbox_DiagnosticsRegisterGuestThread(volatile uint32_t *current_function);
+void xbox_DiagnosticsUnregisterGuestThread(volatile uint32_t *current_function);
+
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
