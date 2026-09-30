@@ -2646,6 +2646,21 @@ static ULONGLONG s_handle_retire_at[BRIDGE_HANDLE_MAX];
 
 #define BRIDGE_HANDLE_RETIRE_MS 1000u
 
+void xbox_ReapRetiredHandles(void)
+{
+    uint32_t i;
+
+    EnterCriticalSection(&s_handle_table_lock);
+    for (i = 1; i < s_handle_next_slot; i++) {
+        if (s_handle_retire_at[i]) {
+            CloseHandle(s_handle_table[i]);
+            s_handle_table[i] = NULL;
+            s_handle_retire_at[i] = 0;
+        }
+    }
+    LeaveCriticalSection(&s_handle_table_lock);
+}
+
 static uint32_t bridge_handle_token(HANDLE h)
 {
     uint32_t i;

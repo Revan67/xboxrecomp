@@ -146,6 +146,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    BOOL directory_open;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -180,7 +181,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
-    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+    directory_open = (CreateOptions & XBOX_FILE_DIRECTORY_FILE) != 0;
+    if (directory_open) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
@@ -198,6 +200,25 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+
+        /* The bridge briefly retains a native handle after the guest closes
+         * it so a worker that already borrowed the Xbox file object can finish
+         * synchronous I/O. Windows continues enforcing that retired handle's
+         * share mode, however, and can reject the guest's immediate reopen.
+         * Reap only already-closed guest handles, and only after the host has
+         * proven there is a sharing conflict, then retry this open once. */
+        if (err == ERROR_SHARING_VIOLATION) {
+            xbox_ReapRetiredHandles();
+            h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+                xbox_share_to_win32(ShareAccess), NULL,
+                directory_open ? OPEN_EXISTING
+                               : xbox_disposition_to_win32(CreateDisposition),
+                directory_open ? FILE_FLAG_BACKUP_SEMANTICS : flags_and_attrs,
+                NULL);
+            if (h != INVALID_HANDLE_VALUE)
+                goto opened;
+            err = GetLastError();
+        }
         /* Kept for the caller's trace. An NTSTATUS says "it did not open";
          * only the Win32 error distinguishes a title probing for a file that
          * is genuinely absent from one it cannot open because this runtime
@@ -222,6 +243,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+opened:
     *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;

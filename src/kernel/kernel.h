@@ -659,6 +659,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
     ULONG CreateDisposition, ULONG CreateOptions);
 
+/* Close native handles whose guest handles have already been closed. Used by
+ * the file layer to resolve a host-only sharing conflict during deferred
+ * handle retirement. */
+void xbox_ReapRetiredHandles(void);
+
 NTSTATUS __stdcall xbox_NtOpenFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
