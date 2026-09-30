@@ -141,6 +141,13 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_FORMAT          0x0208
 #define NV097_SET_SURFACE_PITCH           0x020C
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
+#define NV097_SET_BLEND_ENABLE            0x0304
+#define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
+#define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV097_BLEND_ZERO                  0x0000
+#define NV097_BLEND_ONE                   0x0001
+#define NV097_BLEND_SRC_ALPHA             0x0302
+#define NV097_BLEND_ONE_MINUS_SRC_ALPHA   0x0303
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
 #define NV097_CLEAR_SURFACE               0x1D94
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
@@ -250,6 +257,7 @@ static struct {
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
+    uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
@@ -885,6 +893,55 @@ static void dump_texture_bmp(uint32_t seq)
  * playback rate. */
 static uint8_t *s_surface;          /* host address of surface row 0 */
 
+static uint32_t modulate_argb(uint32_t a, uint32_t b)
+{
+    uint32_t aa = (a >> 24) & 0xFFu, ar = (a >> 16) & 0xFFu;
+    uint32_t ag = (a >>  8) & 0xFFu, ab = a & 0xFFu;
+    uint32_t ba = (b >> 24) & 0xFFu, br = (b >> 16) & 0xFFu;
+    uint32_t bg = (b >>  8) & 0xFFu, bb = b & 0xFFu;
+
+    return (((aa * ba + 127u) / 255u) << 24)
+         | (((ar * br + 127u) / 255u) << 16)
+         | (((ag * bg + 127u) / 255u) <<  8)
+         |  ((ab * bb + 127u) / 255u);
+}
+
+static uint32_t blend_argb(uint32_t src, uint32_t dst)
+{
+    uint32_t sa = (src >> 24) & 0xFFu;
+    uint32_t sf = 255u, df = 0u;
+    uint32_t c, out = 0;
+
+    if (!s_gpu.blend_enable)
+        return src;
+
+    /* The common Xbox UI path, including Third Age's loading spinner. Keep
+     * ONE/ZERO as well so opaque passes remain exact when blending is toggled
+     * without changing the factors. Unknown factors fall back to replace. */
+    switch (s_gpu.blend_sfactor) {
+    case NV097_BLEND_ZERO: sf = 0; break;
+    case NV097_BLEND_ONE: sf = 255; break;
+    case NV097_BLEND_SRC_ALPHA: sf = sa; break;
+    case NV097_BLEND_ONE_MINUS_SRC_ALPHA: sf = 255u - sa; break;
+    default: return src;
+    }
+    switch (s_gpu.blend_dfactor) {
+    case NV097_BLEND_ZERO: df = 0; break;
+    case NV097_BLEND_ONE: df = 255; break;
+    case NV097_BLEND_SRC_ALPHA: df = sa; break;
+    case NV097_BLEND_ONE_MINUS_SRC_ALPHA: df = 255u - sa; break;
+    default: return src;
+    }
+    for (c = 0; c < 4; c++) {
+        uint32_t shift = c * 8;
+        uint32_t v = (((src >> shift) & 0xFFu) * sf
+                    + ((dst >> shift) & 0xFFu) * df + 127u) / 255u;
+        if (v > 255u) v = 255u;
+        out |= v << shift;
+    }
+    return out;
+}
+
 static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
@@ -909,8 +966,15 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        uint32_t *p = (uint32_t *)row + x;
+        *p = blend_argb(argb, *p);
     } else if (bpp == 2) {
+        uint16_t old = ((uint16_t *)row)[x];
+        uint32_t dst = 0xFF000000u
+                     | (((old >> 11) & 0x1Fu) * 255u / 31u << 16)
+                     | (((old >>  5) & 0x3Fu) * 255u / 63u <<  8)
+                     |  (( old        & 0x1Fu) * 255u / 31u);
+        argb = blend_argb(argb, dst);
         ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
@@ -980,7 +1044,7 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
-                    put_pixel(mem, bpp, x, y, texel);
+                    put_pixel(mem, bpp, x, y, modulate_argb(texel, argb));
                     continue;
                 }
             }
@@ -1659,6 +1723,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
+        break;
+    case NV097_SET_BLEND_ENABLE:
+        s_gpu.blend_enable = param != 0;
+        break;
+    case NV097_SET_BLEND_FUNC_SFACTOR:
+        s_gpu.blend_sfactor = param;
+        break;
+    case NV097_SET_BLEND_FUNC_DFACTOR:
+        s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
