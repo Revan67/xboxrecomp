@@ -1906,19 +1906,37 @@ static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 static volatile LONG g_dpc_trace_insertions;
 static volatile LONG g_dpc_trace_runs;
+static CRITICAL_SECTION g_dpc_lock;
+static int g_dpc_lock_initialized;
 
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
     uint32_t arg1 = STACK_ARG(1);
     uint32_t arg2 = STACK_ARG(2);
-    LONG tail, next;
+    LONG head, tail, next, i;
 
     if (!dpc) { g_eax = 0; return; }
 
+    EnterCriticalSection(&g_dpc_lock);
+    head = g_dpc_head;
     tail = g_dpc_tail;
+
+    /* An NT KDPC can be present in the queue only once. Drivers rely on FALSE
+     * here to mean that the already-pending invocation owns the work. Returning
+     * FALSE after actually appending it violates that contract and can make a
+     * caller resubmit or mishandle pending work. */
+    for (i = head; i != tail; i = (i + 1) % XBOX_MAX_PENDING_DPC) {
+        if (g_dpc_queue[i].dpc == dpc) {
+            LeaveCriticalSection(&g_dpc_lock);
+            g_eax = 0;
+            return;
+        }
+    }
+
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
-    if (next == g_dpc_head) {
+    if (next == head) {
+        LeaveCriticalSection(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
         g_eax = 0;
@@ -1928,6 +1946,7 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
+    LeaveCriticalSection(&g_dpc_lock);
     if (getenv("RECOMP_DPC_TRACE")) {
         LONG n = InterlockedIncrement(&g_dpc_trace_insertions);
         if (n <= 64 || (n % 1000) == 0) {
@@ -2137,12 +2156,25 @@ static void kernel_drain_dpcs(void)
      * but that work belongs to the next scheduler pass.  Following the live
      * tail here turns a self-requeueing graphics DPC into an infinite loop and
      * prevents the timer thread from ever delivering another vblank. */
-    LONG stop = g_dpc_tail;
+    LONG stop;
 
-    while (g_dpc_head != stop) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
+    EnterCriticalSection(&g_dpc_lock);
+    stop = g_dpc_tail;
+    LeaveCriticalSection(&g_dpc_lock);
+
+    for (;;) {
+        LONG head;
+        PendingDpc d;
+
+        EnterCriticalSection(&g_dpc_lock);
+        head = g_dpc_head;
+        if (head == stop) {
+            LeaveCriticalSection(&g_dpc_lock);
+            break;
+        }
+        d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+        LeaveCriticalSection(&g_dpc_lock);
         if (getenv("RECOMP_DPC_TRACE")) {
             LONG n = InterlockedIncrement(&g_dpc_trace_runs);
             if (n <= 64 || (n % 1000) == 0) {
@@ -9263,6 +9295,10 @@ void xbox_kernel_bridge_init(void)
     if (!s_handle_table_lock_initialized) {
         InitializeCriticalSection(&s_handle_table_lock);
         s_handle_table_lock_initialized = 1;
+    }
+    if (!g_dpc_lock_initialized) {
+        InitializeCriticalSection(&g_dpc_lock);
+        g_dpc_lock_initialized = 1;
     }
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
