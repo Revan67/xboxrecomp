@@ -1340,6 +1340,55 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static int sync_trace_enabled(void);
+
+/* Some XDK libraries embed dispatcher objects and initialize their guest
+ * headers directly instead of calling the exported KeInitializeEvent thunk.
+ * Such objects therefore have no host shadow when first used.  Materialize
+ * one from the guest KEVENT header on demand so KeSet/Reset/Wait all operate
+ * on the same native event. */
+static HANDLE ke_shadow_get_or_create_event(uint32_t guest_va)
+{
+    HANDLE h = ke_shadow_lookup(guest_va);
+    uint8_t event_type;
+    LONG signal_state;
+
+    if (h || !guest_va)
+        return h;
+
+    event_type = BRIDGE_MEM8(guest_va);
+    signal_state = (LONG)BRIDGE_MEM32(guest_va + 4);
+    h = CreateEventW(NULL, event_type == 0 ? TRUE : FALSE,
+                     signal_state > 0 ? TRUE : FALSE, NULL);
+    if (!h)
+        return NULL;
+
+    ke_shadow_insert(guest_va, h);
+    if (sync_trace_enabled()) {
+        fprintf(stderr, "  [SYNC] materialized guest KEVENT 0x%08X"
+                        " type=%u state=%ld handle=%p\n",
+                guest_va, (unsigned)event_type, (long)signal_state, h);
+        fflush(stderr);
+    }
+    return h;
+}
+
+static int sync_trace_enabled(void)
+{
+    return getenv("RECOMP_SYNC_TRACE") != NULL;
+}
+
+static void sync_trace_signal(const char *op, uint32_t object, HANDLE handle,
+                              uint32_t result)
+{
+    if (!sync_trace_enabled())
+        return;
+    fprintf(stderr, "  [SYNC] t=%llu tid=%lu %s object=0x%08X handle=%p"
+                    " result=0x%08X\n",
+            (unsigned long long)GetTickCount64(),
+            (unsigned long)GetCurrentThreadId(), op, object, handle, result);
+    fflush(stderr);
+}
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
@@ -1352,15 +1401,12 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    h = ke_shadow_get_or_create_event(guest_va);
     if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
         g_eax = 0;
+    sync_trace_signal("KeSetEvent", guest_va, h, g_eax);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -1373,11 +1419,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
+    h = ke_shadow_get_or_create_event(object);
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
@@ -1393,12 +1435,23 @@ static void bridge_KeWaitForSingleObject(void)
  */
 static void bridge_NtWaitForSingleObject(void)
 {
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t token       = STACK_ARG(0);
+    HANDLE   handle      = bridge_resolve_handle(token);
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
+    ULONGLONG started = GetTickCount64();
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (sync_trace_enabled()) {
+        fprintf(stderr, "  [SYNC] t=%llu tid=%lu NtWait object=0x%08X"
+                        " handle=%p timeout=%s elapsed=%llums result=0x%08X\n",
+                (unsigned long long)GetTickCount64(),
+                (unsigned long)GetCurrentThreadId(), token, handle,
+                timeout_ptr ? "finite" : "infinite",
+                (unsigned long long)(GetTickCount64() - started), g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -1406,8 +1459,10 @@ static void bridge_NtWaitForSingleObject(void)
  * before each async map read; a no-op here left the event stuck signalled. */
 static void bridge_NtClearEvent(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t token = STACK_ARG(0);
+    HANDLE handle = bridge_resolve_handle(token);
     g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    sync_trace_signal("NtClearEvent", token, handle, g_eax);
 }
 
 /* ── NtSetEvent (ordinal 225) ────────────────────────────── */
@@ -1417,9 +1472,11 @@ static void bridge_NtClearEvent(void)
  * context's go-event and only the first 14 KB of the map ever loaded. */
 static void bridge_NtSetEvent(void)
 {
-    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t token  = STACK_ARG(0);
+    HANDLE   handle = bridge_resolve_handle(token);
     uint32_t prev   = STACK_ARG(1);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    sync_trace_signal("NtSetEvent", token, handle, g_eax);
 }
 
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
@@ -1446,10 +1503,12 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t token       = STACK_ARG(0);
+    HANDLE   handle      = bridge_resolve_handle(token);
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
+    ULONGLONG started = GetTickCount64();
 
     static int logged = 0;
     if (logged++ < 20) {
@@ -1462,6 +1521,15 @@ static void bridge_NtWaitForSingleObjectEx(void)
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    if (sync_trace_enabled()) {
+        fprintf(stderr, "  [SYNC] t=%llu tid=%lu NtWaitEx object=0x%08X"
+                        " handle=%p timeout=%s elapsed=%llums result=0x%08X\n",
+                (unsigned long long)GetTickCount64(),
+                (unsigned long)GetCurrentThreadId(), token, handle,
+                timeout_ptr ? "finite" : "infinite",
+                (unsigned long long)(GetTickCount64() - started), g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2680,18 +2748,31 @@ static int s_handle_table_lock_initialized;
 static uint32_t s_handle_next_slot = 1;
 static ULONGLONG s_handle_retire_at[BRIDGE_HANDLE_MAX];
 
-#define BRIDGE_HANDLE_RETIRE_MS 1000u
-
-void xbox_ReapRetiredHandles(void)
+void xbox_ReapRetiredHandlesForPath(const WCHAR *path)
 {
     uint32_t i;
+    WCHAR wanted[MAX_PATH * 2];
+
+    if (!path || !GetFullPathNameW(path, ARRAYSIZE(wanted), wanted, NULL))
+        return;
 
     EnterCriticalSection(&s_handle_table_lock);
     for (i = 1; i < s_handle_next_slot; i++) {
         if (s_handle_retire_at[i]) {
-            CloseHandle(s_handle_table[i]);
-            s_handle_table[i] = NULL;
-            s_handle_retire_at[i] = 0;
+            WCHAR actual[MAX_PATH * 2];
+            DWORD n = GetFinalPathNameByHandleW(s_handle_table[i], actual,
+                                                ARRAYSIZE(actual),
+                                                FILE_NAME_NORMALIZED);
+            const WCHAR *comparable = actual;
+            if (n && n < ARRAYSIZE(actual)) {
+                if (wcsncmp(comparable, L"\\\\?\\", 4) == 0)
+                    comparable += 4;
+                if (_wcsicmp(comparable, wanted) == 0) {
+                    CloseHandle(s_handle_table[i]);
+                    s_handle_table[i] = NULL;
+                    s_handle_retire_at[i] = 0;
+                }
+            }
         }
     }
     LeaveCriticalSection(&s_handle_table_lock);
@@ -2704,21 +2785,12 @@ static uint32_t bridge_handle_token(HANDLE h)
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
     EnterCriticalSection(&s_handle_table_lock);
 
-    /* Xbox IRPs retain their file object even if another thread closes the
-     * guest handle.  Our host operation is synchronous, but the title's own
-     * stream worker can receive a borrowed token just before its owner closes
-     * it. Keep closed native handles alive briefly so that in-flight work sees
-     * the same lifetime guarantee, then reap them during later allocations. */
-    {
-        ULONGLONG now = GetTickCount64();
-        for (i = 1; i < s_handle_next_slot; i++) {
-            if (s_handle_retire_at[i] && s_handle_retire_at[i] <= now) {
-                CloseHandle(s_handle_table[i]);
-                s_handle_table[i] = NULL;
-                s_handle_retire_at[i] = 0;
-            }
-        }
-    }
+    /* A guest handle can be closed while an Xbox file object retained by a
+     * worker still refers to it.  There is no safe wall-clock expiry for that
+     * reference: Third Age streams for many seconds after the public handle
+     * is closed.  Retired handles are therefore kept until a later open proves
+     * they cause a sharing conflict, at which point xbox_NtCreateFile invokes
+     * xbox_ReapRetiredHandles and retries once. */
     if (s_handle_next_slot < BRIDGE_HANDLE_MAX) {
         i = s_handle_next_slot++;
         s_handle_table[i] = h;
@@ -2787,7 +2859,7 @@ static HANDLE bridge_take_handle(uint32_t token)
         EnterCriticalSection(&s_handle_table_lock);
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
             if (s_handle_table[i] && !s_handle_retire_at[i])
-                s_handle_retire_at[i] = GetTickCount64() + BRIDGE_HANDLE_RETIRE_MS;
+                s_handle_retire_at[i] = 1;
         }
         LeaveCriticalSection(&s_handle_table_lock);
         /* Retirement owns the native handle now; NtClose must not close it a
@@ -6750,9 +6822,7 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    h = ke_shadow_get_or_create_event(guest_va);
     if (h)
         PulseEvent(h);
 
@@ -6808,9 +6878,7 @@ static void bridge_KeResetEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    h = ke_shadow_get_or_create_event(guest_va);
     if (h)
         ResetEvent(h);
 

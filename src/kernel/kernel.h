@@ -662,7 +662,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 /* Close native handles whose guest handles have already been closed. Used by
  * the file layer to resolve a host-only sharing conflict during deferred
  * handle retirement. */
-void xbox_ReapRetiredHandles(void);
+void xbox_ReapRetiredHandlesForPath(const WCHAR *path);
 
 NTSTATUS __stdcall xbox_NtOpenFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,

@@ -208,7 +208,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * Reap only already-closed guest handles, and only after the host has
          * proven there is a sharing conflict, then retry this open once. */
         if (err == ERROR_SHARING_VIOLATION) {
-            xbox_ReapRetiredHandles();
+            xbox_ReapRetiredHandlesForPath(win_path);
             h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
                 xbox_share_to_win32(ShareAccess), NULL,
                 directory_open ? OPEN_EXISTING
