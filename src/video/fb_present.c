@@ -218,11 +218,16 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb &&
-            !InterlockedCompareExchange(&s_fb_latched, 0, 0)) {
-            const uint8_t *src =
-                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
-            fb_convert(src, s_fb_pitch / s_fb_width);
+        if (s_fb_va && s_fb_pitch && s_rgb) {
+            if (!InterlockedCompareExchange(&s_fb_latched, 0, 0)) {
+                const uint8_t *src =
+                    (const uint8_t *)((uintptr_t)s_fb_va +
+                                      xbox_GetMemoryOffset());
+                fb_convert(src, s_fb_pitch / s_fb_width);
+            }
+            /* A latched frame has already been converted synchronously, but
+             * it still needs to be copied into the window.  Skipping this
+             * blit froze the visible client area on its earlier black frame. */
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
